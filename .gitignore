@@ -1,3 +1,5 @@
+/target
+**/*.rs.bk
 # Rust build artifacts
 /target
 **/*.rs.bk
