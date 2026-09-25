@@ -1,6 +1,7 @@
 use crate::metadata::{self, TokenMetadata};
 use crate::storage_types::DataKey;
 use crate::{admin, balance, control};
+use crate::{admin, balance};
 use soroban_sdk::{contract, contractimpl, Address, Env, String};
 
 #[contract]
@@ -14,6 +15,8 @@ fn initialize_state(
     co_signer: &Option<Address>,
     meta: &TokenMetadata,
 ) {
+/// Stores the admin and the token metadata, refusing a second call.
+fn initialize_state(e: &Env, admin_addr: &Address, meta: &TokenMetadata) {
     if admin::is_initialized(e) {
         panic!("AlreadyInitialized: contract state is locked");
     }
@@ -47,6 +50,16 @@ impl VeriTixPay {
         e: Env,
         admin_addr: Address,
         co_signer: Option<Address>,
+        initialize_state(&e, &admin_addr, &metadata::defaults(&e));
+    }
+
+    /// Sets the admin and caller-supplied token metadata.
+    ///
+    /// Same one-shot rule as [`initialize`]; use this when the deployment needs
+    /// a token name, symbol or precision other than the defaults.
+    pub fn initialize_with_metadata(
+        e: Env,
+        admin_addr: Address,
         name: String,
         symbol: String,
         decimals: u32,
@@ -134,6 +147,11 @@ impl VeriTixPay {
     /// Admin-only and supply-capped. This is the prerequisite the rest of the
     /// token module is built on: without a way to bring supply into
     /// circulation there is nothing to transfer, burn or claw back.
+    /// Mints `amount` new tokens to `to`.
+    ///
+    /// Admin-only and supply-capped: the cap is the first place a supply limit
+    /// has to hold, so the check lives in the balance module next to the
+    /// arithmetic it protects rather than being repeated by every caller.
     pub fn mint(e: Env, admin_addr: Address, to: Address, amount: i128) {
         admin::check_admin(&e, &admin_addr);
         balance::mint(&e, &to, amount);
@@ -213,6 +231,24 @@ mod tests {
 
     fn funded(client: &VeriTixPayClient<'static>, admin: &Address, holder: &Address, amount: i128) {
         client.mint(admin, holder, &amount);
+    /// Installs a supply cap. Choosing the cap belongs to the initializer, so
+    /// the test writes the storage key directly instead of adding a setter that
+    /// no issue has asked for.
+    fn install_cap(e: &Env, contract_id: &Address, cap: i128) {
+        e.as_contract(contract_id, || {
+            e.storage().persistent().set(&DataKey::MaxSupply, &cap);
+        });
+    }
+
+    fn setup_capped(cap: i128) -> (Env, VeriTixPayClient<'static>, Address) {
+        let e = Env::default();
+        e.mock_all_auths();
+        let contract_id = e.register_contract(None, VeriTixPay);
+        let client = VeriTixPayClient::new(&e, &contract_id);
+        let admin = Address::generate(&e);
+        client.initialize(&admin);
+        install_cap(&e, &contract_id, cap);
+        (e, client, admin)
     }
 
     #[test]
@@ -237,6 +273,7 @@ mod tests {
 
     #[test]
     fn test_initialize_with_co_signer_stores_signer_and_metadata() {
+    fn test_initialize_with_metadata_overrides_defaults() {
         let e = Env::default();
         e.mock_all_auths();
         let contract_id = e.register_contract(None, VeriTixPay);
@@ -247,6 +284,9 @@ mod tests {
         client.initialize_with_co_signer(
             &admin,
             &Some(co_signer.clone()),
+
+        client.initialize_with_metadata(
+            &admin,
             &String::from_str(&e, "Event Tickets"),
             &String::from_str(&e, "VTIX"),
             &2,
@@ -255,6 +295,8 @@ mod tests {
         assert_eq!(client.admin(), admin);
         assert_eq!(client.co_signer(), Some(co_signer));
         assert_eq!(client.name(), String::from_str(&e, "Event Tickets"));
+        assert_eq!(client.name(), String::from_str(&e, "Event Tickets"));
+        assert_eq!(client.symbol(), String::from_str(&e, "VTIX"));
         assert_eq!(client.decimals(), 2);
     }
 
@@ -279,6 +321,10 @@ mod tests {
         client.burn(&holder, &1_000);
 
         assert_eq!(client.balance(&holder), 0);
+    fn test_balance_and_supply_start_at_zero() {
+        let (e, client, _admin) = setup();
+        let user = Address::generate(&e);
+        assert_eq!(client.balance(&user), 0);
         assert_eq!(client.total_supply(), 0);
     }
 
@@ -359,6 +405,13 @@ mod tests {
         client.transfer(&from, &to, &1_000);
 
         assert_eq!(client.balance(&from), 0);
+    fn test_mint_credits_balance_and_grows_supply() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+
+        client.mint(&admin, &user, &1_000);
+
+        assert_eq!(client.balance(&user), 1_000);
         assert_eq!(client.total_supply(), 1_000);
     }
 
@@ -436,6 +489,15 @@ mod tests {
         assert_eq!(client.balance(&to), 100);
         assert!(!client.is_frozen(&from));
         assert!(!client.is_paused());
+    fn test_mint_accumulates_across_calls() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+
+        client.mint(&admin, &user, &1_000);
+        client.mint(&admin, &user, &500);
+
+        assert_eq!(client.balance(&user), 1_500);
+        assert_eq!(client.total_supply(), 1_500);
     }
 
     #[test]
@@ -537,6 +599,64 @@ mod tests {
         let events = e.events().all();
         let last = events.events().last().expect("no events recorded");
         let xdr::ContractEventBody::V0(body) = &last.body else {
+    fn test_mint_rejects_non_admin() {
+        let (e, client, _admin) = setup();
+        let stranger = Address::generate(&e);
+        let user = Address::generate(&e);
+        client.mint(&stranger, &user, &1_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidAmount")]
+    fn test_mint_rejects_zero_amount() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+        client.mint(&admin, &user, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidAmount")]
+    fn test_mint_rejects_negative_amount() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+        client.mint(&admin, &user, &(-1));
+    }
+
+    #[test]
+    #[should_panic(expected = "SupplyCapExceeded")]
+    fn test_mint_rejects_amount_over_the_cap() {
+        let (e, client, admin) = setup_capped(1_000);
+        let user = Address::generate(&e);
+        client.mint(&admin, &user, &1_001);
+    }
+
+    #[test]
+    fn test_mint_allows_amount_exactly_at_the_cap() {
+        let (e, client, admin) = setup_capped(1_000);
+        let user = Address::generate(&e);
+        client.mint(&admin, &user, &1_000);
+        assert_eq!(client.total_supply(), 1_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "SupplyCapExceeded")]
+    fn test_mint_counts_prior_mints_against_the_cap() {
+        let (e, client, admin) = setup_capped(1_000);
+        let user = Address::generate(&e);
+        client.mint(&admin, &user, &600);
+        client.mint(&admin, &user, &500);
+    }
+
+    #[test]
+    fn test_mint_emits_event_with_standard_topics_and_data() {
+        let (e, client, admin) = setup();
+        let user = Address::generate(&e);
+
+        client.mint(&admin, &user, &1_000);
+
+        let events = e.events().all();
+        assert_eq!(events.events().len(), 1);
+        let xdr::ContractEventBody::V0(body) = &events.events()[0].body else {
             panic!("expected a v0 contract event");
         };
         assert_eq!(
@@ -616,5 +736,13 @@ mod tests {
         let (e, client, _admin) = setup();
         let stranger = Address::generate(&e);
         assert_eq!(client.spendable_balance(&stranger), 0);
+                xdr::ScVal::from_val(&e, &symbol_short!("mint").to_val()),
+                xdr::ScVal::from_val(&e, &user.to_val()),
+            ]
+        );
+        assert_eq!(
+            body.data,
+            xdr::ScVal::from_val(&e, &vec![&e, 1_000i128].to_val())
+        );
     }
 }

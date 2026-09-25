@@ -71,3 +71,4 @@ pub fn initialized_at_ledger(e: &Env) -> u32 {
         .get(&DataKey::InitializedAtLedger)
         .unwrap_or(0)
 }
+}
